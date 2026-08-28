@@ -86,8 +86,13 @@ export class TrueForgeClient {
   }
 
   /**
-   * Subscribe to a turn's SSE stream. Returns an unsubscribe fn. EventSource
-   * auto-resumes via Last-Event-ID; late joiners get the buffered replay.
+   * Subscribe to a turn's SSE stream. Returns an unsubscribe fn.
+   *
+   * Uses a fetch-based SSE transport (not native EventSource) specifically so the
+   * bearer token reaches the stream: EventSource can only set `withCredentials`
+   * and cannot add an Authorization header, which would leave a deployed/OIDC
+   * server's subscription unauthenticated while the POSTs succeed. We handle
+   * Last-Event-ID resume and reconnection ourselves.
    */
   subscribeTurn(
     sessionId: string,
@@ -96,24 +101,86 @@ export class TrueForgeClient {
     onEnd?: (state: TfTurnDoneState) => void,
   ): () => void {
     const url = `${this.base}/api/v1/sessions/${sessionId}/turns/${turnId}/subscribe`;
-    const es = new EventSource(url, { withCredentials: !!this.headers.Authorization });
-    es.onmessage = (m) => {
-      let data: TfEvent;
-      try {
-        data = JSON.parse(m.data) as TfEvent;
-      } catch {
-        return;
-      }
-      onEvent(data);
-      if (data.type === 'turn.done') {
-        onEnd?.(data.state);
-        es.close();
+    const ac = new AbortController();
+    let lastEventId: string | undefined;
+    let ended = false;
+
+    const run = async () => {
+      while (!ended && !ac.signal.aborted) {
+        try {
+          const res = await fetch(url, {
+            headers: {
+              ...this.headers,
+              Accept: 'text/event-stream',
+              ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+            },
+            signal: ac.signal,
+            credentials: this.headers.Authorization ? 'include' : 'same-origin',
+          });
+          // 412 = the replay buffer expired (turn long finished); stop, don't loop.
+          if (res.status === 412 || res.status === 404) return;
+          if (!res.ok || !res.body) throw new Error(`subscribe ${res.status}`);
+          await parseSseStream(res.body, ac.signal, (id, dataLines) => {
+            if (id) lastEventId = id;
+            if (!dataLines) return;
+            let data: TfEvent;
+            try {
+              data = JSON.parse(dataLines) as TfEvent;
+            } catch {
+              return;
+            }
+            onEvent(data);
+            if (data.type === 'turn.done') {
+              ended = true;
+              onEnd?.(data.state);
+              ac.abort();
+            }
+          });
+        } catch (err) {
+          if (ac.signal.aborted || ended) return;
+          // transient drop — brief backoff, then reconnect from Last-Event-ID.
+          await new Promise((r) => setTimeout(r, 800));
+        }
       }
     };
-    es.onerror = () => {
-      /* EventSource retries on its own; a permanent 412 (buffer gone) simply stops it. */
+    void run();
+    return () => {
+      ended = true;
+      ac.abort();
     };
-    return () => es.close();
+  }
+}
+
+/** Parse an SSE byte stream into (id, data) events, respecting an abort signal. */
+async function parseSseStream(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  onFrame: (id: string | undefined, data: string | undefined) => void,
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // events are separated by a blank line
+      let sep: number;
+      while ((sep = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        let id: string | undefined;
+        const dataParts: string[] = [];
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('id:')) id = line.slice(3).trim();
+          else if (line.startsWith('data:')) dataParts.push(line.slice(5).trimStart());
+        }
+        onFrame(id, dataParts.length ? dataParts.join('\n') : undefined);
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {});
   }
 }
 

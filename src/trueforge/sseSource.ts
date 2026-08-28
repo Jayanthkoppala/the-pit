@@ -52,9 +52,10 @@ export function incidentSource(opts: IncidentSourceOptions): IncidentSource {
     start(emit: (e: FleetEvent) => void) {
       let stop = () => {};
       let cancelled = false;
-      // remember the tool name/args each model.message requested, so an
-      // approval event (which only carries a source_event_id) can be enriched.
-      const toolByEvent = new Map<string, { name: string; args: string }>();
+      // remember each tool call's name/args by its OWN id, so an approval event
+      // (whose tool_calls[].id matches the model.message tool call) resolves to
+      // the right tool — even when one message requests several tools.
+      const toolById = new Map<string, { name: string; args: string }>();
       let sessionId = '';
 
       (async () => {
@@ -93,29 +94,37 @@ export function incidentSource(opts: IncidentSourceOptions): IncidentSource {
               emit({ kind: 'state', at, id: evt.thread_id, state: 'thinking' });
               if (evt.usage?.output_tokens) emit({ kind: 'tokens', at, id: evt.thread_id, delta: evt.usage.output_tokens });
               break;
-            case 'model.message':
-              // tool calls live INSIDE model.message — record them and mark 'tool'
-              for (const tc of evt.tool_calls ?? []) {
-                toolByEvent.set(evt.id, { name: tc.function.name, args: tc.function.arguments });
+            case 'model.message': {
+              // tool calls live INSIDE model.message — record each by its own id.
+              const calls = evt.tool_calls ?? [];
+              for (const tc of calls) {
+                toolById.set(tc.id, { name: tc.function.name, args: tc.function.arguments });
                 emit({ kind: 'state', at, id: evt.thread_id, state: 'tool', task: tc.function.name });
-                emit({ kind: 'tool', at, id: evt.thread_id, tokens: evt.usage?.output_tokens });
+                emit({ kind: 'tool', at, id: evt.thread_id }); // count the tool call itself
               }
-              if (!evt.tool_calls?.length && evt.content)
+              // usage is per-MESSAGE, not per tool — attribute it exactly once.
+              if (evt.usage?.output_tokens)
+                emit({ kind: 'tokens', at, id: evt.thread_id, delta: evt.usage.output_tokens });
+              if (!calls.length && evt.content)
                 emit({ kind: 'state', at, id: evt.thread_id, state: 'thinking', task: evt.content.slice(0, 60) });
               break;
+            }
             case 'tool.response':
               emit({ kind: 'state', at, id: evt.thread_id, state: 'thinking' });
               break;
             case 'tool.approval_required': {
-              const call = evt.tool_calls[0];
-              const enriched = toolByEvent.get(call.source_event_id) ?? { name: 'destructive action', args: '' };
-              emit({ kind: 'state', at, id: evt.thread_id, state: 'blocked', task: enriched.name });
-              opts.onApprovalRequired?.({
-                threadId: evt.thread_id,
-                toolCallId: call.id,
-                toolName: enriched.name,
-                args: enriched.args,
-              });
+              // surface EVERY gated call, each with its own resolved metadata —
+              // dropping the extras would ask the human about the wrong action.
+              for (const call of evt.tool_calls) {
+                const meta = toolById.get(call.id) ?? { name: 'destructive action', args: '' };
+                emit({ kind: 'state', at, id: evt.thread_id, state: 'blocked', task: meta.name });
+                opts.onApprovalRequired?.({
+                  threadId: evt.thread_id,
+                  toolCallId: call.id,
+                  toolName: meta.name,
+                  args: meta.args,
+                });
+              }
               break;
             }
             case 'thread.done':
