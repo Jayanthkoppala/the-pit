@@ -36,6 +36,17 @@ async function promRange(query, mins = 30, stepSec = 60) {
 }
 const round = v => (v == null || Number.isNaN(+v) ? null : Math.round(+v * 1000) / 1000);
 
+// All deploys/compose mutations go through this promise chain so two overlapping
+// calls (agent rollback racing a /demo click) can never interleave the
+// read-modify-write on deploys.json and corrupt it. deploy.sh adds an flock on
+// hosts that have it (the Linux VM); this covers macOS, where flock is absent.
+let deployChain = Promise.resolve();
+const serializeDeploy = fn => {
+  const run = deployChain.then(fn, fn);
+  deployChain = run.then(() => {}, () => {});
+  return run;
+};
+
 function build() {
   const srv = new McpServer({ name: 'ops', version: '0.2.0' });
 
@@ -111,11 +122,12 @@ function build() {
 
   srv.registerTool('rollback_deploy', {
     description: 'DESTRUCTIVE: deploy payments at a previous release (e.g. v1.4.1). Irreversibly changes what runs in production.',
-    inputSchema: { release: z.string().describe('release tag to deploy, e.g. v1.4.1') },
+    inputSchema: { release: z.string().regex(/^v\d+\.\d+\.\d+$/, 'must be a semver tag like v1.4.1').describe('release tag to deploy, e.g. v1.4.1') },
     annotations: { readOnlyHint: false, destructiveHint: true },
   }, async ({ release }) => {
     try {
-      const { stdout } = await exec('bash', [path.join(WORLD, 'deploy.sh'), release, 'incident-crew', 'rollback'], { timeout: 120_000 });
+      const stdout = await serializeDeploy(async () =>
+        (await exec('bash', [path.join(WORLD, 'deploy.sh'), release, 'incident-crew', 'rollback'], { timeout: 120_000 })).stdout);
       return text(stdout.trim());
     } catch (e) { return err(String(e)); }
   });
@@ -126,7 +138,7 @@ function build() {
     annotations: { readOnlyHint: false, destructiveHint: true },
   }, async ({ service }) => {
     try {
-      await exec('docker', ['compose', 'restart', service], { cwd: WORLD, timeout: 120_000 });
+      await serializeDeploy(() => exec('docker', ['compose', 'restart', service], { cwd: WORLD, timeout: 120_000 }));
       return text(`restarted ${service}`);
     } catch (e) { return err(String(e)); }
   });
@@ -136,10 +148,26 @@ function build() {
 
 const app = express();
 app.use(express.json());
+
+// CORS for the /demo/* levers only, scoped to a local console origin — never '*'.
+// The browser must NOT call /mcp directly: the agent reaches MCP server-side via
+// TrueForge; the browser only pulls the break/reset levers. Registered before the
+// routes so the headers actually apply.
+const ALLOWED_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGIN.test(origin)) { res.header('Access-Control-Allow-Origin', origin); res.header('Vary', 'Origin'); }
+  else if (origin === 'null') { res.header('Access-Control-Allow-Origin', 'null'); } // console opened as file://
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.post('/mcp', async (req, res) => {
+  const server = build();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on('close', () => transport.close());
-  await build().connect(transport);
+  res.on('close', () => { transport.close(); server.close(); });
+  await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 app.get('/healthz', async (_q, r) => {
@@ -149,26 +177,22 @@ app.get('/healthz', async (_q, r) => {
   } catch { r.json({ ok: true, current: 'unknown' }); }
 });
 
-// CORS so the browser console UI can drive the demo directly.
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
 // Demo controls the USER pulls (not agent tools): break the world, or reset it.
 // The agent still only heals via the destructive, gated MCP tools.
+// The world has one real, honest failure mode: shipping v1.4.2 breaks checkout
+// (retry-queue lookup against an unmigrated queue). We don't fake latency/oom
+// variants that would just redeploy the same release under a different label.
 const SCENARIOS = {
   deploy: { release: 'v1.4.2', note: 'ship the retry-queue misdeploy' },
 };
 async function runDeploy(release, note) {
-  const { stdout } = await exec('bash', [path.join(WORLD, 'deploy.sh'), release, 'you', note], { timeout: 120_000 });
-  return stdout.trim();
+  return serializeDeploy(async () =>
+    (await exec('bash', [path.join(WORLD, 'deploy.sh'), release, 'you', note], { timeout: 120_000 })).stdout.trim());
 }
 app.post('/demo/break', async (req, res) => {
-  const scn = SCENARIOS[req.query.scenario] || SCENARIOS.deploy;
+  const key = req.query.scenario ?? 'deploy';
+  const scn = SCENARIOS[key];
+  if (!scn) return res.status(400).json({ ok: false, error: `unknown scenario '${key}'; known: ${Object.keys(SCENARIOS).join(', ')}` });
   try { res.json({ ok: true, out: await runDeploy(scn.release, scn.note) }); }
   catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
