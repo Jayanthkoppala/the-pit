@@ -29,7 +29,12 @@ receipts: every timeline entry links to the query that proved it.
 7. **What went well / what went poorly / where we got lucky** — three honest lists.
 8. **Action items** — a table: description · type (mitigate / prevent / process) · owner ·
    tracking link. Every root cause and contributing factor gets at least one item.
-9. **Supporting receipts** — the raw queries, dashboards, and log excerpts the timeline cites.
+9. **Supporting receipts** — the raw queries, dashboards, and log excerpts the timeline cites,
+   **redacted before they are committed.** These land permanently in the PR and repo history, so
+   strip credentials, tokens, connection strings, cookies/headers, PII, and customer identifiers
+   first — replace each with a typed placeholder (`<REDACTED:token>`). If a receipt cannot be
+   safely redacted, cite it by query and result shape instead of pasting it. When in doubt, leave
+   it out.
 
 ## Delivery
 
