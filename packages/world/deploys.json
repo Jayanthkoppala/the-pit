@@ -1,0 +1,13 @@
+{
+ "service": "payments",
+ "current": "v1.4.1",
+ "deploys": [
+  {
+   "id": "d-101",
+   "release": "v1.4.1",
+   "at": "2026-08-28T09:00:00Z",
+   "by": "asha",
+   "note": "bump stripe client"
+  }
+ ]
+}

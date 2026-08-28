@@ -1,0 +1,33 @@
+# The breakable world: api → payments, Prometheus watching, loadgen breathing.
+# `../..`-relative paths assume `docker compose` runs from packages/world.
+services:
+  payments:
+    build: ./payments
+    environment:
+      - RELEASE=${PAYMENTS_RELEASE:-v1.4.1}
+    ports:
+      - '7402:7402'
+  api:
+    build: ./api
+    environment:
+      - PAYMENTS_URL=http://payments:7402
+    ports:
+      - '7401:7401'
+    depends_on:
+      - payments
+  loadgen:
+    image: node:22-alpine
+    volumes:
+      - ./loadgen/loadgen.js:/loadgen.js:ro
+    command: ['node', '/loadgen.js']
+    environment:
+      - API_URL=http://api:7401
+    depends_on:
+      - api
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - '9090:9090'

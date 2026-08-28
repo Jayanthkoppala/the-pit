@@ -1,0 +1,14 @@
+groups:
+  - name: incident-floor
+    rules:
+      - alert: HighCheckoutErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="api",route="/checkout",status="500"}[2m]))
+            /
+          sum(rate(http_requests_total{job="api",route="/checkout"}[2m])) > 0.05
+        for: 1m
+        labels:
+          severity: critical
+          service: payments-api
+        annotations:
+          summary: 'Checkout error rate above 5% ({{ $value | printf "%.0f%%" }})'
