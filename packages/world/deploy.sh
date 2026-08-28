@@ -3,6 +3,9 @@
 # The deploy history (deploys.json) is what the agents read via the ops MCP.
 set -euo pipefail
 cd "$(dirname "$0")"
+# Serialize concurrent deploys where flock exists (Linux VM/CI). On hosts without
+# it (macOS dev) the ops-mcp server serializes these calls instead.
+if command -v flock >/dev/null 2>&1; then exec 9>".deploy.lock"; flock 9; fi
 REL="${1:?usage: deploy.sh <release e.g. v1.4.2>}"
 BY="${2:-dev-bot}"
 NOTE="${3:-}"
