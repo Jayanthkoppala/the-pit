@@ -149,4 +149,32 @@ app.get('/healthz', async (_q, r) => {
   } catch { r.json({ ok: true, current: 'unknown' }); }
 });
 
+// CORS so the browser console UI can drive the demo directly.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Demo controls the USER pulls (not agent tools): break the world, or reset it.
+// The agent still only heals via the destructive, gated MCP tools.
+const SCENARIOS = {
+  deploy: { release: 'v1.4.2', note: 'ship the retry-queue misdeploy' },
+};
+async function runDeploy(release, note) {
+  const { stdout } = await exec('bash', [path.join(WORLD, 'deploy.sh'), release, 'you', note], { timeout: 120_000 });
+  return stdout.trim();
+}
+app.post('/demo/break', async (req, res) => {
+  const scn = SCENARIOS[req.query.scenario] || SCENARIOS.deploy;
+  try { res.json({ ok: true, out: await runDeploy(scn.release, scn.note) }); }
+  catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post('/demo/reset', async (_q, res) => {
+  try { res.json({ ok: true, out: await runDeploy('v1.4.1', 'reset to healthy baseline') }); }
+  catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
 app.listen(7311, () => console.log('ops-mcp v2 on http://localhost:7311/mcp → world at', WORLD));
